@@ -1,0 +1,389 @@
+#!/usr/bin/env python3
+"""
+Mini Git - A simplified version control system
+Teaches: SHA-1 hashing, object storage, trees & blobs, snapshot architecture
+"""
+
+import os
+import sys
+import hashlib
+import time
+import json
+import zlib
+from pathlib import Path
+from typing import Optional, Dict, List, Tuple
+
+
+class MyGit:
+    """Core Mini Git implementation"""
+    
+    def __init__(self, path: str = "."):
+        self.root = Path(path).resolve()
+        self.mygit_dir = self.root / ".mygit"
+        self.objects_dir = self.mygit_dir / "objects"
+        self.refs_dir = self.mygit_dir / "refs"
+        self.head_file = self.mygit_dir / "HEAD"
+        self.index_file = self.mygit_dir / "index"
+    
+    def init(self) -> None:
+        """Initialize a new mygit repository"""
+        if self.mygit_dir.exists():
+            print(f"Repository already initialized at {self.mygit_dir}")
+            return
+        
+        # Create directory structure
+        self.mygit_dir.mkdir()
+        self.objects_dir.mkdir()
+        (self.refs_dir / "heads").mkdir(parents=True)
+        
+        # Initialize HEAD to point to main branch
+        self.head_file.write_text("ref: refs/heads/main\n")
+        
+        # Initialize empty index
+        self.index_file.write_text(json.dumps({}))
+        
+        print(f"Initialized empty mygit repository in {self.mygit_dir}")
+    
+    def hash_object(self, content: bytes, obj_type: str = "blob") -> str:
+        """
+        Hash content using SHA-1 (like Git)
+        Format: <type> <size>\0<content>
+        Returns the 40-character hex hash
+        """
+        header = f"{obj_type} {len(content)}\0".encode()
+        full_content = header + content
+        sha = hashlib.sha1(full_content).hexdigest()
+        
+        # Store object (zlib compressed)
+        obj_dir = self.objects_dir / sha[:2]
+        obj_file = obj_dir / sha[2:]
+        
+        if not obj_file.exists():
+            obj_dir.mkdir(exist_ok=True)
+            compressed = zlib.compress(full_content)
+            obj_file.write_bytes(compressed)
+        
+        return sha
+    
+    def read_object(self, sha: str) -> Tuple[str, bytes]:
+        """Read and decompress an object by its hash"""
+        obj_file = self.objects_dir / sha[:2] / sha[2:]
+        if not obj_file.exists():
+            raise ValueError(f"Object {sha} not found")
+        
+        compressed = obj_file.read_bytes()
+        full_content = zlib.decompress(compressed)
+        
+        # Parse header
+        null_idx = full_content.index(b'\0')
+        header = full_content[:null_idx].decode()
+        obj_type, _ = header.split()
+        content = full_content[null_idx + 1:]
+        
+        return obj_type, content
+    
+    def add(self, filepath: str) -> None:
+        """Stage a file for commit"""
+        file_path = self.root / filepath
+        
+        if not file_path.exists():
+            print(f"Error: pathspec '{filepath}' did not match any files")
+            return
+        
+        # Read file content and create blob
+        content = file_path.read_bytes()
+        blob_hash = self.hash_object(content, "blob")
+        
+        # Update index
+        index = self._read_index()
+        relative_path = str(file_path.relative_to(self.root))
+        index[relative_path] = blob_hash
+        self._write_index(index)
+        
+        print(f"Staged: {filepath} ({blob_hash[:7]})")
+    
+    def _read_index(self) -> Dict[str, str]:
+        """Read the staging area"""
+        if not self.index_file.exists():
+            return {}
+        return json.loads(self.index_file.read_text())
+    
+    def _write_index(self, index: Dict[str, str]) -> None:
+        """Write the staging area"""
+        self.index_file.write_text(json.dumps(index, indent=2))
+    
+    def _get_current_commit(self) -> Optional[str]:
+        """Get the hash of the current HEAD commit"""
+        if not self.head_file.exists():
+            return None
+        
+        head_content = self.head_file.read_text().strip()
+        
+        if head_content.startswith("ref: "):
+            # HEAD points to a branch
+            ref_path = self.mygit_dir / head_content[5:]
+            if ref_path.exists():
+                return ref_path.read_text().strip() or None
+            return None
+        else:
+            # Detached HEAD
+            return head_content
+    
+    def _write_tree(self, index: Dict[str, str]) -> str:
+        """
+        Create a tree object from the index
+        Tree format: <mode> <name>\0<20-byte SHA> (repeated for each entry)
+        """
+        entries = []
+        for filepath, blob_hash in sorted(index.items()):
+            mode = "100644"  # Regular file mode
+            entries.append((mode, filepath, blob_hash))
+        
+        # Build tree content
+        tree_content = b""
+        for mode, name, sha in entries:
+            tree_content += f"{mode} {name}\0".encode()
+            tree_content += bytes.fromhex(sha)
+        
+        return self.hash_object(tree_content, "tree")
+    
+    def commit(self, message: str, author: str = "User <user@example.com>") -> str:
+        """
+        Create a commit from the staged changes
+        Commit format:
+            tree <tree_hash>
+            parent <parent_hash> (optional)
+            author <author> <timestamp>
+            committer <author> <timestamp>
+            
+            <message>
+        """
+        index = self._read_index()
+        
+        if not index:
+            print("Nothing to commit (empty staging area)")
+            return ""
+        
+        # Create tree from index
+        tree_hash = self._write_tree(index)
+        
+        # Get parent commit
+        parent_hash = self._get_current_commit()
+        
+        # Build commit content
+        timestamp = int(time.time())
+        timezone = "+0000"
+        
+        commit_lines = [
+            f"tree {tree_hash}",
+        ]
+        if parent_hash:
+            commit_lines.append(f"parent {parent_hash}")
+        commit_lines.extend([
+            f"author {author} {timestamp} {timezone}",
+            f"committer {author} {timestamp} {timezone}",
+            "",
+            message,
+        ])
+        
+        commit_content = "\n".join(commit_lines).encode()
+        commit_hash = self.hash_object(commit_content, "commit")
+        
+        # Update HEAD
+        self._update_head(commit_hash)
+        
+        # Clear index after commit
+        self._write_index({})
+        
+        print(f"[{self._get_branch_name() or 'HEAD'} {commit_hash[:7]}] {message}")
+        return commit_hash
+    
+    def _get_branch_name(self) -> Optional[str]:
+        """Get current branch name"""
+        if not self.head_file.exists():
+            return None
+        head_content = self.head_file.read_text().strip()
+        if head_content.startswith("ref: refs/heads/"):
+            return head_content[16:]
+        return None
+    
+    def _update_head(self, commit_hash: str) -> None:
+        """Update HEAD to point to the new commit"""
+        head_content = self.head_file.read_text().strip()
+        
+        if head_content.startswith("ref: "):
+            # Update branch reference
+            ref_path = self.mygit_dir / head_content[5:]
+            ref_path.parent.mkdir(parents=True, exist_ok=True)
+            ref_path.write_text(commit_hash + "\n")
+        else:
+            # Update detached HEAD
+            self.head_file.write_text(commit_hash + "\n")
+    
+    def log(self, commit_hash: Optional[str] = None, max_count: int = 10) -> None:
+        """Display commit history"""
+        if commit_hash is None:
+            commit_hash = self._get_current_commit()
+        
+        if not commit_hash:
+            print("No commits yet")
+            return
+        
+        count = 0
+        while commit_hash and count < max_count:
+            try:
+                obj_type, content = self.read_object(commit_hash)
+            except ValueError:
+                print(f"Error: commit {commit_hash} not found")
+                break
+            
+            if obj_type != "commit":
+                print(f"Error: {commit_hash} is not a commit")
+                break
+            
+            # Parse commit
+            lines = content.decode().split("\n")
+            
+            tree_hash = ""
+            parent_hash = ""
+            author_info = ""
+            message_lines = []
+            in_message = False
+            
+            for line in lines:
+                if in_message:
+                    message_lines.append(line)
+                elif line.startswith("tree "):
+                    tree_hash = line[5:]
+                elif line.startswith("parent "):
+                    parent_hash = line[7:]
+                elif line.startswith("author "):
+                    author_info = line[7:]
+                elif line == "":
+                    in_message = True
+            
+            message = "\n".join(message_lines)
+            
+            # Parse author and date
+            author_parts = author_info.rsplit(" ", 2)
+            author_name = author_parts[0] if len(author_parts) > 2 else author_info
+            timestamp = int(author_parts[-2]) if len(author_parts) > 2 else 0
+            date_str = time.strftime("%a %b %d %H:%M:%S %Y", time.localtime(timestamp))
+            
+            # Print commit
+            print(f"\033[33mcommit {commit_hash}\033[0m")
+            if parent_hash:
+                print(f"Parent: {parent_hash}")
+            print(f"Author: {author_name}")
+            print(f"Date:   {date_str}")
+            print(f"Tree:   {tree_hash[:7]}")
+            print()
+            print(f"    {message}")
+            print()
+            
+            # Move to parent
+            commit_hash = parent_hash
+            count += 1
+    
+    def status(self) -> None:
+        """Show working tree status"""
+        index = self._read_index()
+        
+        print("On branch", self._get_branch_name() or "(detached HEAD)")
+        
+        current_commit = self._get_current_commit()
+        if current_commit:
+            print(f"Current commit: {current_commit[:7]}")
+        else:
+            print("No commits yet")
+        
+        print()
+        
+        if index:
+            print("Changes to be committed:")
+            print('  (use "mygit reset HEAD <file>..." to unstage)')
+            print()
+            for filepath in index:
+                print(f"\t\033[32mnew file:   {filepath}\033[0m")
+        else:
+            print("Nothing staged for commit")
+
+
+def main():
+    """CLI entry point"""
+    if len(sys.argv) < 2:
+        print("Usage: mygit <command> [<args>]")
+        print()
+        print("Commands:")
+        print("  init              Initialize a new repository")
+        print("  add <file>        Stage a file for commit")
+        print("  commit -m <msg>   Create a commit")
+        print("  log               Show commit history")
+        print("  status            Show working tree status")
+        sys.exit(1)
+    
+    command = sys.argv[1]
+    
+    # Find repository root
+    cwd = Path.cwd()
+    repo_root = cwd
+    while repo_root != repo_root.parent:
+        if (repo_root / ".mygit").exists():
+            break
+        repo_root = repo_root.parent
+    else:
+        repo_root = cwd
+    
+    git = MyGit(repo_root)
+    
+    if command == "init":
+        git.init()
+    
+    elif command == "add":
+        if len(sys.argv) < 3:
+            print("Usage: mygit add <file>")
+            sys.exit(1)
+        
+        # Check if repo is initialized
+        if not git.mygit_dir.exists():
+            print("Not a mygit repository. Run 'mygit init' first.")
+            sys.exit(1)
+        
+        git.add(sys.argv[2])
+    
+    elif command == "commit":
+        if not git.mygit_dir.exists():
+            print("Not a mygit repository. Run 'mygit init' first.")
+            sys.exit(1)
+        
+        message = ""
+        if len(sys.argv) >= 4 and sys.argv[2] == "-m":
+            message = sys.argv[3]
+        else:
+            print("Usage: mygit commit -m \"<message>\"")
+            sys.exit(1)
+        
+        git.commit(message)
+    
+    elif command == "log":
+        if not git.mygit_dir.exists():
+            print("Not a mygit repository. Run 'mygit init' first.")
+            sys.exit(1)
+        
+        git.log()
+    
+    elif command == "status":
+        if not git.mygit_dir.exists():
+            print("Not a mygit repository. Run 'mygit init' first.")
+            sys.exit(1)
+        
+        git.status()
+    
+    else:
+        print(f"Unknown command: {command}")
+        print("Run 'mygit' for usage information")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
